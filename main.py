@@ -12,6 +12,8 @@ from functools import reduce
 class Dgp(nn.Module):
     def __init__(self, dim, K):
         super(Dgp, self).__init__()
+        self.dim = dim
+        self.K = K
 
         self.mu_x = nn.Parameter(th.randn(dim))
         self.sigma_x = nn.Parameter(th.eye(dim))
@@ -30,11 +32,20 @@ class Dgp(nn.Module):
         return self.mu_y[z], self.sigma_y
 
     def logp_y_x(self, y, x):
+        N = x.shape[0]
+        K = self.K
+        H = self.dim
         logp_z_x = self.logp_z_x(x)
         logp_y_z = th.distributions.MultivariateNormal(
-            *self.logp_y_zx(self.mu_y, self.sigma_y)
+            *self.logp_y_zx(
+                th.arange(0, self.K, device=x.device).unsqueeze(0).repeat(N, 1),
+                x,
+            )
         )
-        return (logp_y_z.log_prob(y) + logp_z_x).logsumexp(-1)
+        return (
+            logp_y_z.log_prob(y.view(N, 1, H).expand(N, K, H))
+            + logp_z_x
+        ).logsumexp(-1)
 
     # p(y | x)
     def forward(self, x):
@@ -50,7 +61,7 @@ class Dgp(nn.Module):
 # models: MLPs...ReLU i guess. predict means
 
 class Mlp(nn.Module):
-    def __init__(self, num_layers=3, dp=0.5):
+    def __init__(self, dim, num_layers=3, dp=0.5):
         super(Mlp, self).__init__()
 
         self.layers = [
@@ -58,20 +69,62 @@ class Mlp(nn.Module):
         ]
         self.dropout = nn.Dropout(dp)
         self.sigma = nn.Parameter(th.eye(dim))
+        self.sigma.requires_grad = False
 
     def forward(self, x):
         return reduce(
             lambda hidden, module: module(self.dropout(hidden)),
-            self.layers,
+            self.layers[1:],
+            self.layers[0](x)
         ), self.sigma
 
 def main():
     dim = 256
     K = 64
+    N = 32
     dgp = Dgp(dim, K)
-    x, y, z = dgp.sample()
-    x1, y1, z1 = dgp.sample((10,))
-    import pdb; pdb.set_trace()
+
+    dgp_hat = Dgp(dim, K)
+    optimizer_dgp_hat = th.optim.Adam(dgp_hat.parameters(), lr = 1e-3)
+
+    #mlp = Mlp(dim, 3, 0.3)
+    mlp = Mlp(dim, 3, 0.)
+    parameters = list(mlp.parameters())
+    optimizer_mlp = th.optim.Adam(parameters, lr = 1e-3)
+
+    mlp_dp = Mlp(dim, 3, 0.3)
+    optimizer_mlp_dp = th.optim.Adam(mlp_dp.parameters(), lr = 1e-3)
+
+    n_batches = int(1e3)
+    for i in range(n_batches):
+        x, y, z = dgp.sample((N,))
+        dgp_logp_y_x = dgp.logp_y_x(y, x)
+        true_nll = -dgp_logp_y_x.mean()
+
+        dgp_hat_logp_y_x = dgp_hat.logp_y_x(y, x)
+        hat_nll = -dgp_hat_logp_y_x.mean()
+
+        optimizer_dgp_hat.zero_grad()
+        hat_nll.backward()
+        optimizer_dgp_hat.step()
+
+        mlp_dist = th.distributions.MultivariateNormal(*mlp(x))
+        mlp_logp_y_x = mlp_dist.log_prob(y)
+        mlp_nll = -mlp_logp_y_x.mean()
+
+        optimizer_mlp.zero_grad()
+        mlp_nll.backward()
+        optimizer_mlp.step()
+
+        mlp_dp_dist = th.distributions.MultivariateNormal(*mlp_dp(x))
+        mlp_dp_logp_y_x = mlp_dp_dist.log_prob(y)
+        mlp_dp_nll= -mlp_dp_logp_y_x.mean()
+
+        optimizer_mlp_dp.zero_grad()
+        mlp_dp_nll.backward()
+        optimizer_mlp_dp.step()
+
+        print(f"{mlp_dp_nll.item():.2f}, {mlp_nll.item():.2f}, {hat_nll.item():.2f}, {true_nll.item():.2f}")
 
 
 if __name__ == "__main__":
